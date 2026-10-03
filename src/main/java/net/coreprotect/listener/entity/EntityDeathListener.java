@@ -5,6 +5,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.bukkit.Bukkit;
 import org.bukkit.Color;
@@ -55,6 +57,7 @@ import org.bukkit.entity.Zoglin;
 import org.bukkit.entity.Zombie;
 import org.bukkit.entity.ZombieVillager;
 import org.bukkit.entity.memory.MemoryKey;
+import org.bukkit.event.Cancellable;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
@@ -74,6 +77,7 @@ import net.coreprotect.CoreProtect;
 import net.coreprotect.bukkit.BukkitAdapter;
 import net.coreprotect.config.Config;
 import net.coreprotect.consumer.Queue;
+import net.coreprotect.database.Database;
 import net.coreprotect.listener.player.EntityInteractionListener;
 import net.coreprotect.paper.PaperAdapter;
 import net.coreprotect.spigot.SpigotAdapter;
@@ -94,6 +98,33 @@ public final class EntityDeathListener extends Queue implements Listener {
         MemoryKey.MEETING_POINT,
         MemoryKey.LAST_WORKED_AT_POI
     };
+    private static final Map<UUID, Object[]> pendingArmorStandBreaks = new ConcurrentHashMap<>();
+
+    // Armor stand contents can't be read on EntityDeathEvent (in survival mode), so the damage listeners capture them here
+    protected static void trackArmorStandBreak(Entity armorStand, String user, ItemStack[] contents) {
+        UUID uuid = armorStand.getUniqueId();
+        Object[] pendingBreak = new Object[] { user, contents };
+        pendingArmorStandBreaks.put(uuid, pendingBreak);
+
+        // onEntityDeath logs the break if the hit was lethal. Otherwise, discard the capture on the next tick, or when Folia retires
+        // the stand's scheduler (unload or any other removal). Neither callback touches the world.
+        Runnable discard = () -> pendingArmorStandBreaks.remove(uuid, pendingBreak);
+        Scheduler.scheduleSyncDelayedTask(CoreProtect.getInstance(), discard, discard, armorStand, 0);
+    }
+
+    private static void logArmorStandBreak(ArmorStand armorStand) {
+        Object[] pendingBreak = pendingArmorStandBreaks.remove(armorStand.getUniqueId());
+        if (pendingBreak == null) {
+            return;
+        }
+
+        String user = (String) pendingBreak[0];
+        ItemStack[] contents = (ItemStack[]) pendingBreak[1];
+        Location entityLocation = armorStand.getLocation();
+        Block block = entityLocation.getBlock();
+        Database.containerBreakCheck(user, Material.ARMOR_STAND, armorStand, contents, block.getLocation());
+        Queue.queueBlockBreak(user, block.getState(), Material.ARMOR_STAND, null, (int) entityLocation.getYaw());
+    }
 
     public static void parseEntityKills(String message) {
         message = message.trim().toLowerCase(Locale.ROOT);
@@ -294,7 +325,6 @@ public final class EntityDeathListener extends Queue implements Listener {
                 age.add(ageable.getAgeLock());
                 age.add(ageable.isAdult());
                 age.add(ageable.canBreed());
-                age.add(null);
             }
 
             if (entity instanceof Tameable) {
@@ -321,7 +351,9 @@ public final class EntityDeathListener extends Queue implements Listener {
                             attributeModifiers.add(modifier.serialize());
                         }
 
-                        attributeData.add(attributeModifiers);
+                        if (!attributeModifiers.isEmpty()) {
+                            attributeData.add(attributeModifiers);
+                        }
                         attributes.add(attributeData);
                     }
                 }
@@ -406,7 +438,13 @@ public final class EntityDeathListener extends Queue implements Listener {
                     List<Object> itemMap = new ArrayList<>();
                     ItemStack item = merchantRecipe.getResult().clone();
                     List<List<Map<String, Object>>> metadata = ItemMetaHandler.serialize(item, item.getType(), null, 0);
-                    item.setItemMeta(null);
+                    try {
+                        if (item.hasItemMeta() && item.getItemMeta() != null) {
+                            item.setItemMeta(null);
+                        }
+                    }
+                    catch (Exception ignored) {
+                    }
                     itemMap.add(item.serialize());
                     itemMap.add(metadata);
                     recipe.add(itemMap);
@@ -418,7 +456,13 @@ public final class EntityDeathListener extends Queue implements Listener {
                         itemMap = new ArrayList<>();
                         item = ingredient.clone();
                         metadata = ItemMetaHandler.serialize(item, item.getType(), null, 0);
-                        item.setItemMeta(null);
+                        try {
+                            if (item.hasItemMeta() && item.getItemMeta() != null) {
+                                item.setItemMeta(null);
+                            }
+                        }
+                        catch (Exception ignored) {
+                        }
                         itemMap.add(item.serialize());
                         itemMap.add(metadata);
                         ingredients.add(itemMap);
@@ -561,6 +605,7 @@ public final class EntityDeathListener extends Queue implements Listener {
                 PaperAdapter.ADAPTER.getEntityMeta(entity, info);
             }
 
+            trimTrailingNulls(info);
             data.add(age);
             data.add(tame);
             data.add(info);
@@ -578,6 +623,12 @@ public final class EntityDeathListener extends Queue implements Listener {
             else {
                 Queue.queuePlayerKill(e, entity.getLocation(), entity.getName());
             }
+        }
+    }
+
+    private static void trimTrailingNulls(List<Object> values) {
+        while (!values.isEmpty() && values.get(values.size() - 1) == null) {
+            values.remove(values.size() - 1);
         }
     }
 
@@ -650,6 +701,10 @@ public final class EntityDeathListener extends Queue implements Listener {
             EntityInteractionListener.flushPendingInteractions(entity);
             Queue.queueEntitySpawnRemoved(entity);
             EntitySpawnTracking.clearTracking(entity.getUniqueId());
+        }
+
+        if (entity instanceof ArmorStand && !(event instanceof Cancellable && ((Cancellable) event).isCancelled())) {
+            logArmorStandBreak((ArmorStand) entity);
         }
 
         logEntityDeath(entity, null);
